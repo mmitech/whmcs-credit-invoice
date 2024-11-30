@@ -37,3 +37,15 @@ add_hook('AdminInvoicesControlsOutput', 1, function($vars) {
 
     return ob_get_clean();
 });
+
+add_hook('ClientAreaPageViewInvoice', 1, function($vars) {
+    $module = CreditModule::getInstance();
+    
+    return [
+        'notes' => $module->formatNotes($vars['notes'] ?? '', true),
+        'pagetitle' => $module->formatPageTitle(
+            (int)$vars['invoiceid'], 
+            $vars['pagetitle'] ?? ''
+        ),
+    ];
+});
