@@ -2,169 +2,223 @@
 
 use WHMCS\Billing\Invoice;
 use WHMCS\Database\Capsule;
-use WHMCS\Config\Setting;
 use WHMCS\Carbon;
+use WHMCS\Config\Setting;
 
+class CreditModule
+{
+    private static $instance = null;
+    protected $config;
+    protected $db;
 
-function credit_invoice_credit() {
-    $settings = Setting::allAsArray();
-    $addonSettings = credit_invoice_getconfig();
-    $invoiceId = filter_input(INPUT_POST, 'invoice', FILTER_SANITIZE_NUMBER_INT);
-    
-    $invoice = Invoice::with([
-            'items',
-            'snapshot'
-        ])
-        ->findOrFail($invoiceId);
-
-    // Duplicate original invoice (this is the credit note).
-    $creditNoteData = [
-        'userid' => $invoice->userid,
-        'notes' => "Refund Invoice|{$invoiceId}|DO-NOT-REMOVE",
-    ];
-
-    foreach ($invoice->items as $idx => $item) {
-        $amount = ((bool) $addonSettings['negateInvoice']) ? -$item->amount : $item->amount;
-        $creditNoteData['itemdescription' . $idx] = $item->description;
-        $creditNoteData['itemamount' . $idx] = $amount;
-        $creditNoteData['itemtaxed' . $idx] = $item->taxed;
+    private function __construct()
+    {
+        $this->db = Capsule::connection();
+        $this->loadConfig();
     }
 
-    $creditNoteResult = localApi('CreateInvoice', $creditNoteData);
+    public static function getInstance(): self
+    {
+        if (self::$instance === null) {
+            self::$instance = new self();
+        }
+        return self::$instance;
+    }
 
-    $now = Carbon::now();
+    protected function loadConfig(): void
+    {
+        $this->config = Capsule::table('tbladdonmodules')
+            ->where('module', 'credit_invoice')
+            ->pluck('value', 'setting')
+            ->toArray();
+    }
 
-    $creditNote = Invoice::with([
-            'snapshot',
-        ])
-        ->findOrFail($creditNoteResult['invoiceid']);
+    public function getConfig(): array
+    {
+        $gateways = Capsule::table('tblpaymentgateways')
+            ->where('setting', 'name')
+            ->orderBy('order')
+            ->pluck('value', 'gateway')
+            ->toArray();
 
-    $creditNote->status = 'Paid';
-    $creditNote->paymentmethod = $addonSettings['creditNotePaymentMethod'];
-    $creditNote->datepaid = $now;
+        return [
+            'name' => 'Credit Note Manager',
+            'description' => 'Create and manage credit notes from invoices',
+            'author' => 'Updated for Modern WHMCS',
+            'language' => 'english',
+            'version' => '2.0',
+            'fields' => [
+                'negateInvoice' => [
+                    'FriendlyName' => 'Negate invoice',
+                    'Type' => 'yesno',
+                    'Description' => 'Create credit notes with negative amounts',
+                    'Default' => 'yes',
+                ],
+                'cancelInvoice' => [
+                    'FriendlyName' => "Set invoice to 'Cancelled'",
+                    'Type' => 'yesno',
+                    'Description' => "Change status for original invoice to 'Cancelled'",
+                ],
+                'creditNoteNoteText' => [
+                    'FriendlyName' => 'Credit Note Text',
+                    'Type' => 'text',
+                    'Description' => '{NUMBER} indicates invoice number or ID if missing',
+                    'Default' => 'CREDIT NOTE: Cancels invoice #{NUMBER}',
+                ],
+                'invoiceNoteText' => [
+                    'FriendlyName' => 'Invoice Note Text',
+                    'Type' => 'text',
+                    'Description' => '{NUMBER} indicates invoice number or ID if missing',
+                    'Default' => 'Cancelled via credit note #{NUMBER}',
+                ],
+                'creditNotePaymentMethod' => [
+                    'FriendlyName' => 'Credit Note Payment Method',
+                    'Type' => 'dropdown',
+                    'Options' => array_merge(['' => "-- Don't set payment method --"], $gateways),
+                    'Description' => 'Mark credit notes as paid with this gateway',
+                ],
+                'creditNotePageTitle' => [
+                    'FriendlyName' => 'Credit Note Page Title',
+                    'Type' => 'text',
+                    'Description' => 'Leave blank for default ({NUMBER} for invoice number)',
+                ],
+            ],
+        ];
+    }
 
-    // since we manually change status of invoice to 'Paid'
-    // we need to set correct invoicenum taking other format fields into account
-    if ((bool) $settings['SequentialInvoiceNumbering']) {
-        $replace = [
-            '{YEAR}' => $now->format('Y'),
-            '{MONTH}' => $now->format('m'),
-            '{DAY}' => $now->format('d'),
-            '{NUMBER}' => $settings['SequentialInvoiceNumberValue'],
+    public function createCreditNote(int $invoiceId): ?Invoice
+    {
+        $invoice = Invoice::with(['items', 'snapshot'])->findOrFail($invoiceId);
+        
+        $creditNoteData = [
+            'userid' => $invoice->userid,
+            'notes' => "Refund Invoice|{$invoiceId}|DO-NOT-REMOVE",
         ];
 
-        $creditNote->invoicenum = str_replace(
-            array_keys($replace), 
-            array_values($replace), 
-            $settings['SequentialInvoiceNumberFormat']
+        foreach ($invoice->items as $idx => $item) {
+            $amount = (bool)$this->config['negateInvoice'] ? -$item->amount : $item->amount;
+            $creditNoteData["itemdescription{$idx}"] = htmlspecialchars($item->description);
+            $creditNoteData["itemamount{$idx}"] = $amount;
+            $creditNoteData["itemtaxed{$idx}"] = $item->taxed;
+        }
+
+        $result = localApi('CreateInvoice', $creditNoteData);
+        if ($result['result'] !== 'success') {
+            return null;
+        }
+
+        $creditNote = Invoice::with(['snapshot'])->findOrFail($result['invoiceid']);
+        $now = Carbon::now();
+        
+        $this->setupCreditNote($creditNote, $now);
+        $this->updateOriginalInvoice($invoice, $creditNote->id);
+
+        return $creditNote;
+    }
+
+    protected function setupCreditNote(Invoice $creditNote, Carbon $date): void
+    {
+        $creditNote->status = 'Paid';
+        $creditNote->paymentmethod = $this->config['creditNotePaymentMethod'];
+        $creditNote->datepaid = $date;
+
+        if ($this->shouldUseSequentialNumbering()) {
+            $this->applySequentialNumbering($creditNote, $date);
+        }
+
+        $creditNote->save();
+    }
+
+    protected function shouldUseSequentialNumbering(): bool
+    {
+        return (bool)Setting::getValue('SequentialInvoiceNumbering');
+    }
+
+    protected function applySequentialNumbering(Invoice $invoice, Carbon $date): void
+    {
+        $format = Setting::getValue('SequentialInvoiceNumberFormat');
+        $currentValue = Setting::getValue('SequentialInvoiceNumberValue');
+        
+        $replace = [
+            '{YEAR}' => $date->format('Y'),
+            '{MONTH}' => $date->format('m'),
+            '{DAY}' => $date->format('d'),
+            '{NUMBER}' => $currentValue,
+        ];
+
+        $invoice->invoicenum = str_replace(
+            array_keys($replace),
+            array_values($replace),
+            $format
         );
 
-        // increment 'SequentialInvoiceNumberValue' value
-        $nextInvoiceNum = ($settings['SequentialInvoiceNumberValue'] + $settings['InvoiceIncrement']);
-        Setting::setValue('SequentialInvoiceNumberValue', $nextInvoiceNum);
+        $increment = Setting::getValue('InvoiceIncrement');
+        Setting::setValue('SequentialInvoiceNumberValue', $currentValue + $increment);
     }
 
-    // copy original client snapshot data if applicable
-    if ((bool) $settings['StoreClientDataSnapshotOnInvoiceCreation']) {
-        if (!is_null($invoice->snapshot)) {
-            $creditNote->snapshot->clientsdetails = $invoice->snapshot->clientsdetails;
-            $creditNote->snapshot->customfields = $invoice->snapshot->customfields;
-        }
+    protected function updateOriginalInvoice(Invoice $invoice, int $creditNoteId): void
+    {
+        $notes = explode(PHP_EOL, $invoice->notes);
+        array_unshift($notes, "Refund Credit Note|{$creditNoteId}|DO-NOT-REMOVE");
+
+        $invoice->status = (bool)$this->config['cancelInvoice'] ? 'Cancelled' : 'Paid';
+        $invoice->notes = implode(PHP_EOL, $notes);
+        $invoice->save();
     }
 
-    $creditNote->save();
-
-    // Mark original invoice as paid and add reference to credit note.
-    $notes = explode(PHP_EOL, $invoice->adminNotes);
-    array_unshift($notes, "Refund Credit Note|{$creditNote->id}|DO-NOT-REMOVE");
-
-    $invoice->status = ((bool) $addonSettings['cancelInvoice']) ? 'Cancelled' : 'Paid';
-    $invoice->adminNotes = implode(PHP_EOL, $notes);
-    $invoice->save();
-
-    // Finally redirect to our credit note.
-    redirect_to_invoice($creditNote->id);
-}
-
-function invoice_is_credited($invoiceId) {
-    $invoice = Invoice::findOrFail($invoiceId);
-
-    if (preg_match('/Refund Credit Note\|(\d*)/', $invoice->adminNotes, $match)) {
-        return $match;
-    }
-
-    return false;
-}
-
-function invoice_is_creditnote($invoiceId) {
-    $invoice = Invoice::findOrFail($invoiceId);
-    
-    if (preg_match('/Refund Invoice\|(\d*)/', $invoice->adminNotes, $match)) {
-        return $match;
-    }
-
-    return false;
-}
-
-function redirect_to_invoice($invoiceId) {
-    header("Location: invoices.php?action=edit&id={$invoiceId}");
-    die();
-}
-
-function credit_invoice_getconfig() {
-    $module = basename(dirname(__FILE__));
-
-    $config = Capsule::table('tbladdonmodules')
-        ->where('module', $module)
-        ->pluck('value', 'setting');
-
-    return $config;
-}
-
-function credit_invoice_replace_notes($invoiceNotes, $html=false) {
-    $addonSettings = credit_invoice_getconfig();
-    $notes = str_replace('<br />', '', $invoiceNotes);
-    $notes = explode(PHP_EOL, $notes);
-
-    foreach ($notes as $idx => $note) {
-        if (preg_match('/Refund Invoice\|(\d*)/', $note, $match)) {
-            // credit note
-            $text = $addonSettings['creditNoteNoteText'];
-        } elseif (preg_match('/Refund Credit Note\|(\d*)/', $note, $match)) {
-            // credited invoice
-            $text = $addonSettings['invoiceNoteText'];
-        }     
-
-        if ($match) {
-            $invoice = Invoice::find($match[1]);
-            $invoiceNum = ($invoice->invoicenum) ? $invoice->invoicenum : $match[1];
-            $notes[$idx] = str_replace('{NUMBER}', $invoiceNum, $text);
-        }
-    }
-
-    $return = implode(PHP_EOL, $notes);
-
-    if ($html) {
-        $return = nl2br($return);
-    }
-
-    return $return;
-}
-
-
-function credit_invoice_replace_pagetitle($invoiceId, $pageTitle) {
-    $addonSettings = credit_invoice_getconfig();
-
-    if (!invoice_is_creditnote($invoiceId))
-        return $pageTitle;
-
-    if (empty($addonSettings['creditNotePageTitle'])) {
-        $return = $pageTitle;
-    } else {
+    public function isInvoiceCredited(int $invoiceId): ?int
+    {
         $invoice = Invoice::findOrFail($invoiceId);
-        $invoiceNum = ($invoice->invoicenum) ? $invoice->invoicenum : $invoiceId;
-        $return = str_replace('{NUMBER}', $invoiceNum, $addonSettings['creditNotePageTitle']);
+        if (preg_match('/Refund Credit Note\|(\d+)/', $invoice->notes, $match)) {
+            return (int)$match[1];
+        }
+        return null;
     }
 
-    return $return;
+    public function isCreditNote(int $invoiceId): ?int
+    {
+        $invoice = Invoice::findOrFail($invoiceId);
+        if (preg_match('/Refund Invoice\|(\d+)/', $invoice->notes, $match)) {
+            return (int)$match[1];
+        }
+        return null;
+    }
+
+    public function formatNotes(string $notes, bool $html = false): string
+    {
+        $notes = str_replace('<br />', '', $notes);
+        $notes = explode(PHP_EOL, $notes);
+        
+        foreach ($notes as $idx => $note) {
+            if (preg_match('/Refund Invoice\|(\d+)/', $note, $match)) {
+                $text = $this->config['creditNoteNoteText'];
+            } elseif (preg_match('/Refund Credit Note\|(\d+)/', $note, $match)) {
+                $text = $this->config['invoiceNoteText'];
+            } else {
+                continue;
+            }
+
+            $invoice = Invoice::find($match[1]);
+            $invoiceNum = $invoice->invoicenum ?: $match[1];
+            $notes[$idx] = str_replace('{NUMBER}', htmlspecialchars($invoiceNum), $text);
+        }
+
+        $return = implode(PHP_EOL, $notes);
+        return $html ? nl2br($return) : $return;
+    }
+
+    public function formatPageTitle(int $invoiceId, string $pageTitle): string
+    {
+        if (!$this->isCreditNote($invoiceId)) {
+            return $pageTitle;
+        }
+
+        if (empty($this->config['creditNotePageTitle'])) {
+            return $pageTitle;
+        }
+
+        $invoice = Invoice::findOrFail($invoiceId);
+        $invoiceNum = $invoice->invoicenum ?: $invoiceId;
+        return str_replace('{NUMBER}', htmlspecialchars($invoiceNum), $this->config['creditNotePageTitle']);
+    }
 }
