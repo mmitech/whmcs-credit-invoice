@@ -94,38 +94,40 @@ class CreditModule
             'userid' => $invoice->userid,
             'notes' => "Refund Invoice|{$invoiceId}|DO-NOT-REMOVE",
         ];
-
+    
         foreach ($invoice->items as $idx => $item) {
             $amount = (bool)$this->config['negateInvoice'] ? -$item->amount : $item->amount;
-            $creditNoteData["itemdescription{$idx}"] = htmlspecialchars($item->description);
+            $creditNoteData["itemdescription{$idx}"] = "Credit Note for Invoice #{$invoiceId}: " . htmlspecialchars($item->description);
             $creditNoteData["itemamount{$idx}"] = $amount;
             $creditNoteData["itemtaxed{$idx}"] = $item->taxed;
         }
-
+    
         $result = localApi('CreateInvoice', $creditNoteData);
         if ($result['result'] !== 'success') {
-            return null;
+            throw new Exception("Failed to create credit note");
         }
-
+    
         $creditNote = Invoice::with(['snapshot'])->findOrFail($result['invoiceid']);
         $now = Carbon::now();
         
         $this->setupCreditNote($creditNote, $now);
         $this->updateOriginalInvoice($invoice, $creditNote->id);
-
+    
         return $creditNote;
     }
-
+    
     protected function setupCreditNote(Invoice $creditNote, Carbon $date): void
     {
         $creditNote->status = 'Paid';
-        $creditNote->paymentmethod = $this->config['creditNotePaymentMethod'];
+        if (!empty($this->config['creditNotePaymentMethod'])) {
+            $creditNote->paymentmethod = $this->config['creditNotePaymentMethod'];
+        }
         $creditNote->datepaid = $date;
-
+    
         if ($this->shouldUseSequentialNumbering()) {
             $this->applySequentialNumbering($creditNote, $date);
         }
-
+    
         $creditNote->save();
     }
 

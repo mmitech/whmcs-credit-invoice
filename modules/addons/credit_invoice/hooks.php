@@ -24,32 +24,16 @@ add_hook('AdminInvoicesControlsOutput', 1, function($vars) {
     <?php else: ?>
         <form method="POST" 
               action="addonmodules.php?module=credit_invoice" 
-              name="credit_invoice_actions" 
-              style="display:inline;margin-top:5px;">
+              style="display:inline;">
             <input type="hidden" name="invoice" value="<?= $invoiceId ?>">
             <button type="submit" 
                     name="action" 
                     value="credit"
-                    class="button btn btn-default"
-                    data-toggle="tooltip"
-                    data-placement="left"
-                    title="Create credit note with reversed line items">
+                    class="button btn btn-default">
                 Create Credit Note
             </button>
         </form>
     <?php endif;
 
     return ob_get_clean();
-});
-
-add_hook('ClientAreaPageViewInvoice', 1, function($vars) {
-    $module = CreditModule::getInstance();
-    
-    return [
-        'notes' => $module->formatNotes($vars['notes'] ?? '', true),
-        'pagetitle' => $module->formatPageTitle(
-            (int)$vars['invoiceid'], 
-            $vars['pagetitle'] ?? ''
-        ),
-    ];
 });
